@@ -2,6 +2,7 @@ import asyncio
 import os
 
 import edge_tts
+import requests
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -19,6 +20,10 @@ PREFERRED_MODELS = [
     "llama-3.1-8b-instant",
 ]
 SKIP_WORDS = ("whisper", "guard", "tts", "safeguard", "compound", "orpheus")
+
+# ---------------------------------------------------------------------------
+# News voice-over (Urdu)
+# ---------------------------------------------------------------------------
 
 # Option 1 (default): Urdu voice, poora text ek hi bar mein, ek hi flow mein
 VOICES = {
@@ -50,6 +55,29 @@ Rules:
 6. Do NOT add, remove or change facts. Do NOT add opinions or extra sentences.
 7. Keep paragraph breaks (blank lines) as they are.
 8. Output ONLY the final Urdu text. No explanations, no quotes, no markdown."""
+
+# ---------------------------------------------------------------------------
+# Quran tilawat (asli qari ki recordings)
+# ---------------------------------------------------------------------------
+# Quran ki tilawat TTS se nahi ki jati: TTS mein tajweed aur makharij sahi nahi
+# aate. Is liye har ayat ki asli qari ki recording use hoti hai (everyayah.com)
+# aur Arabic text alquran.cloud se aata hai. Quran ka text kisi AI model se
+# nahi guzarta, taake is mein koi tabdeeli na ho.
+
+QURAN_API = "https://api.alquran.cloud/v1"
+EVERYAYAH_URL = "https://everyayah.com/data"
+MAX_AYAT = 50  # ek bar mein zyada se zyada itni ayat
+
+RECITERS = {
+    "Mishary Rashid Alafasy": "Alafasy_128kbps",
+    "Abdul Basit (Murattal)": "Abdul_Basit_Murattal_192kbps",
+    "Mahmoud Khalil Al-Husary": "Husary_128kbps",
+    "Mohamed Siddiq Al-Minshawi (Murattal)": "Minshawy_Murattal_128kbps",
+    "Abdur-Rahman As-Sudais": "Abdurrahmaan_As-Sudais_192kbps",
+    "Saud Ash-Shuraim": "Saood_ash-Shuraym_128kbps",
+    "Maher Al-Muaiqly": "Maher_AlMuaiqly_128kbps",
+    "Ali Al-Hudhaify": "Hudhaify_128kbps",
+}
 
 
 def get_api_key():
@@ -111,7 +139,135 @@ def synthesize(text: str, voice: str, rate: int, pitch: int, volume: int) -> byt
     return asyncio.run(_speak(text, voice, rate, pitch, volume))
 
 
+# --- Quran helpers ---------------------------------------------------------
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_surahs():
+    """114 surahs ki list: number, Arabic naam, English naam, ayat ki tadaad."""
+    r = requests.get(f"{QURAN_API}/surah", timeout=20)
+    r.raise_for_status()
+    return r.json()["data"]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_surah_text(surah: int):
+    """Surah ki tamam ayat ka Uthmani Arabic text (jaisa hai waisa)."""
+    r = requests.get(f"{QURAN_API}/surah/{surah}/quran-uthmani", timeout=20)
+    r.raise_for_status()
+    return [a["text"] for a in r.json()["data"]["ayahs"]]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_ayah_audio(folder: str, surah: int, ayah: int) -> bytes:
+    """Ek ayat ki qari ki recording (MP3)."""
+    url = f"{EVERYAYAH_URL}/{folder}/{surah:03d}{ayah:03d}.mp3"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.content
+
+
+def strip_bismillah(surah: int, ayah: int, text: str) -> str:
+    """API pehli ayat ke sath Bismillah jorti hai (Fatiha aur Tawbah ke siwa). Display ke liye hata dete hain."""
+    if ayah == 1 and surah not in (1, 9):
+        parts = text.split(" ", 4)
+        if len(parts) == 5:
+            return parts[4]
+    return text
+
+
+def build_recitation(folder: str, surah: int, start: int, end: int, bismillah: bool) -> bytes:
+    audio = b""
+    if bismillah:
+        audio += get_ayah_audio(folder, 1, 1)  # 001001 = Bismillah
+    for ayah in range(start, end + 1):
+        audio += get_ayah_audio(folder, surah, ayah)
+    return audio
+
+
+def quran_mode():
+    st.title("📖 Quran Tilawat")
+    st.caption("Asli qari ki recording, bilkul sahi tajweed aur talaffuz ke sath.")
+
+    with st.sidebar:
+        st.header("Qari")
+        reciter_label = st.selectbox("Qari", list(RECITERS.keys()))
+
+    try:
+        surahs = get_surahs()
+    except Exception as e:
+        st.error(f"Surah list nahi mili. Internet check karein. ({e})")
+        return
+
+    labels = [f"{s['number']}. {s['englishName']} ({s['name']})" for s in surahs]
+    choice = st.selectbox("Surah", labels)
+    surah = surahs[labels.index(choice)]
+    surah_no = surah["number"]
+    total = surah["numberOfAyahs"]
+
+    col1, col2 = st.columns(2)
+    start = col1.number_input("Ayat se", min_value=1, max_value=total, value=1, step=1)
+    end = col2.number_input("Ayat tak", min_value=1, max_value=total, value=min(total, 5), step=1)
+
+    bismillah = False
+    if surah_no not in (1, 9):
+        bismillah = st.checkbox("Shuru mein Bismillah parhein", value=(start == 1))
+
+    if st.button("Generate tilawat", type="primary"):
+        start, end = int(start), int(end)
+        if end < start:
+            st.warning("'Ayat tak' 'Ayat se' se chhota nahi ho sakta.")
+            st.stop()
+        if end - start + 1 > MAX_AYAT:
+            st.warning(f"Ek bar mein zyada se zyada {MAX_AYAT} ayat. Range chhoti karein.")
+            st.stop()
+
+        with st.spinner("Tilawat tayyar ho rahi hai..."):
+            try:
+                audio = build_recitation(RECITERS[reciter_label], surah_no, start, end, bismillah)
+                texts = get_surah_text(surah_no)[start - 1:end]
+            except Exception as e:
+                st.error(f"Recording ya text nahi mila. Internet check karein ya dusra qari chunein. ({e})")
+                st.stop()
+
+        st.session_state["q_audio"] = audio
+        st.session_state["q_ayat"] = [
+            (start + i, strip_bismillah(surah_no, start + i, t)) for i, t in enumerate(texts)
+        ]
+        st.session_state["q_title"] = f"{surah['englishName']} {start}-{end}"
+        st.session_state["q_reciter"] = reciter_label
+
+    if "q_audio" in st.session_state:
+        st.subheader(f"{st.session_state['q_title']} | {st.session_state['q_reciter']}")
+        st.audio(st.session_state["q_audio"], format="audio/mp3")
+        st.download_button(
+            "⬇️ Download MP3",
+            st.session_state["q_audio"],
+            file_name="tilawat.mp3",
+            mime="audio/mpeg",
+            key="q_download",
+        )
+        with st.expander("Ayat ka text", expanded=True):
+            for num, text in st.session_state["q_ayat"]:
+                st.markdown(
+                    f"<div dir='rtl' style='font-size:30px; line-height:2.2;'>{text} ﴿{num}﴾</div>",
+                    unsafe_allow_html=True,
+                )
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
 st.set_page_config(page_title="Urdu Voice Agent", page_icon="🎙️")
+
+with st.sidebar:
+    mode = st.radio("Mode", ["🎙️ News voice-over", "📖 Quran tilawat"])
+    st.divider()
+
+if mode == "📖 Quran tilawat":
+    quran_mode()
+    st.stop()
+
 st.title("🎙️ Urdu News Voice Agent")
 st.caption("Roman Urdu ya Urdu script likhein, news-caster style awaaz milegi.")
 
